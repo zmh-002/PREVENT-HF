@@ -1,0 +1,336 @@
+/* ==========================================================================
+   Project: CMR Variables and Heart Failure Prediction (PREVENT Model)
+   Part 1: Data Preparation, Exclusion Criteria, and External Score Calculation
+   Software: SAS 9.4
+   ========================================================================== */
+
+libname CMR ' E:\research\CMR '; 
+
+/* --------------------------------------------------------------------------
+   1. Variable Extraction & eGFR Calculation
+   -------------------------------------------------------------------------- */
+data CMR.prevent;
+    merge TMP1.covariates(in=a) TMP1.compress(in=b keep=n_eid n_30700_0_0 n_30700_1_0);
+    by n_eid;
+    if a;
+run;
+
+data CMR.prevent_1;
+    set CMR.prevent;
+    Scr = n_30700_0_0 / 88.4;
+    if SEX = 0 then do; 
+        if Scr <= 0.7 then eGFR = 142 * (Scr / 0.7)**(-0.241) * (0.9938**age);
+        else eGFR = 142 * (Scr / 0.7)**(-1.200) * (0.9938**age);
+    end;
+    else if SEX = 1 then do; 
+        if Scr <= 0.9 then eGFR = 142 * (Scr / 0.9)**(-0.302) * (0.9938**age);
+        else eGFR = 142 * (Scr / 0.9)**(-1.200) * (0.9938**age);
+    end;
+run;
+
+/* --------------------------------------------------------------------------
+   2. Outcome Definitions & Follow-up Time
+   -------------------------------------------------------------------------- */
+data CMR.prevent_2;
+    merge CMR.prevent_1 TMP3.HF_outcomes_1 
+          TMP1.compress(keep=n_eid s_191_0_0 s_53_0_0 s_40000_0_0);
+    by n_eid;
+    
+    if HF_diag_date ne . and s_53_0_0 ne . then HF_before_attend = (HF_diag_date < s_53_0_0);
+    else HF_before_attend = .;
+run;
+
+/* --------------------------------------------------------------------------
+   3. CMR Data Merging & Cleaning
+   -------------------------------------------------------------------------- */
+data CMR.merged_data;
+    merge Tmp1.cmri(keep=n_eid n_41: n_5931_2_0) CMR.prevent_2;
+    by n_eid;
+run;
+
+/* --------------------------------------------------------------------------
+   4. Exclusion Criteria & Cohort Selection
+   -------------------------------------------------------------------------- */
+data CMR.total_final;
+    set CMR.merged_data;
+    
+    /* Age Criteria */
+    if 30 <= age <= 79;
+    
+    /* Pre-existing Disease Exclusion */
+    if HF_before_attend = 1 or missing(HF_diag) then delete;
+    if MI_diag_date ne . and s_53_0_0 ne . and (MI_diag_date < s_53_0_0) then delete;
+    if Stroke_diag_date ne . and s_53_0_0 ne . and (Stroke_diag_date < s_53_0_0) then delete;
+
+    /* Follow-up Time Calculation (Landmark Analysis) */
+    CMR_date = '01JAN2015'd;
+    if not missing(hf_diag_date) and hf_diag_date <= CMR_date then delete;
+    if not missing(s_40000_0_0) and s_40000_0_0 <= CMR_date then delete;
+    
+    followup_end = min(hf_diag_date, s_40000_0_0, s_191_0_0);
+    if missing(followup_end) then followup_end = '31DEC2022'd;
+    
+    followup_time = followup_end - CMR_date;
+    if followup_time > 0;
+    
+    /* Status Definition: 1=HF, 2=Competing Risk, 0=Censored */
+    if hf_diag_date = followup_end then status = 1;
+    else if s_40000_0_0 = followup_end or s_191_0_0 = followup_end then status = 2;
+    else status = 0;
+    
+    /* CMR Data Completeness Check (<80% missing) */
+    if nmiss(of n_4120_2_0--n_4108_2_0) < 80; 
+run;
+
+proc export data=CMR.total_final outfile="Your_Path_Here/total_final.xlsx" dbms=xlsx replace; run;
+
+/* --------------------------------------------------------------------------
+   5. External Score Calculation: PCP-HF (Pooled Cohort Equations)
+   -------------------------------------------------------------------------- */
+data CMR.PCP_Score;
+    set CMR.ukb_selected_vars; 
+    
+    /* Unit Conversion */
+    TC_mg = Total_cholesterol * 38.67;
+    HDL_mg = HDLC * 38.67;
+    Gluc_mg = Fasting_Glucose * 18.018;
+    
+    ln_age = log(age);
+    ln_age_sq = ln_age**2;
+    ln_sbp = log(SBP_combine);
+    ln_bmi = log(bmi);
+    ln_tc = log(TC_mg);
+    ln_hdl = log(HDL_mg);
+    ln_gluc = log(Gluc_mg);
+    ln_qrs = log(QRS_duration);
+    
+    if Smoking_status = 2 then is_current_smoker = 1; else is_current_smoker = 0;
+    if self_BP_drug = 1 then is_bp_treated = 1; else is_bp_treated = 0;
+    if diab_drug = 1 then is_dm_treated = 1; else is_dm_treated = 0;
+
+    IndXP = .; MeanCV = .; S10 = .;
+
+    /* White Men */
+    if Ethnic_background = 1 and sex = 1 then do;
+        IndXP = 41.94 * ln_age - 0.88 * ln_age_sq 
+        + (ifn(is_bp_treated, 1.03, 0.91) * ln_sbp) + 0.74 * is_current_smoker 
+        + (ifn(is_dm_treated, 0.90, 0.78) * ln_gluc) + 0.49 * ln_tc 
+        - 0.44 * ln_hdl + 37.20 * ln_bmi + 0.63 * ln_qrs 
+        - 8.83 * (ln_age * ln_bmi);
+        MeanCV = 171.5; S10 = 0.98752;
+    end;
+    /* White Women */
+    else if Ethnic_background = 1 and sex = 0 then do;
+        IndXP = 20.55 * ln_age + (ifn(is_bp_treated, 12.95, 11.86) * ln_sbp) 
+        + 11.02 * is_current_smoker + (ifn(is_dm_treated, 1.04, 0.91) * ln_gluc) 
+        - 0.07 * ln_hdl + 1.33 * ln_bmi + 1.06 * ln_qrs;
+        if is_bp_treated then IndXP = IndXP - 2.96 * (ln_age * ln_sbp);
+        else IndXP = IndXP - 2.73 * (ln_age * ln_sbp);
+        IndXP = IndXP - 2.50 * (ln_age * is_current_smoker);
+        MeanCV = 99.73; S10 = 0.99348;
+    end;
+    /* (Black Men/Women logic omitted for brevity, referencing original code logic) */
+
+    if IndXP ne . then PCP_Risk_Percent = (1 - (S10 ** exp(IndXP - MeanCV))) * 100;
+run;
+
+/* --------------------------------------------------------------------------
+   6. External Score Calculation: ARIC HF Risk Score
+   -------------------------------------------------------------------------- */
+data CMR.ARIC_Score;
+    set CMR.ukb_selected_vars;
+    
+    if sex = 1 then Male = 1; else Male = 0;
+    if Ethnic_background = 2 then Black = 1; else Black = 0;
+    Current_Smoker = (Smoking_status = 2);
+    Former_Smoker = (Smoking_status = 1);
+
+    XB = 0.093 * (age - 65) + 0.019 * (Black) + 0.202 * (Male) 
+       + 0.026 * (Heart_rate - 60) + 0.008 * (SBP_combine - 120) 
+       + 0.338 * (self_BP_drug) + 0.672 * (Sdiab) 
+       + 1.084 * (Prevalent_CHD) + 0.976 * (Current_Smoker) 
+       + 0.360 * (Former_Smoker) + 0.054 * (bmi - 25);
+       
+    S0_10yr = 0.99671;
+    if XB ne . then ARIC_HF_Score_Pct = (1 - (S0_10yr ** exp(XB))) * 100;
+run;
+
+/* Export Scores for R Analysis */
+data CMR.Final_Comparison_Set;
+    merge CMR.total_final(in=a) CMR.PCP_Score CMR.ARIC_Score;
+    by n_eid;
+    if a;
+run;
+proc export data=CMR.Final_Comparison_Set outfile="Your_Path_Here/Final_Comparison_Set.xlsx" dbms=xlsx replace; run;
+ 
+# ==============================================================================
+# Project: CMR Variables and Heart Failure Prediction
+# Part 2: Statistical Analysis (LASSO, Fine-Gray, RCS, Validation)
+# Language: R
+# ==============================================================================
+
+library(readxl)
+library(writexl)
+library(dplyr)
+library(glmnet)
+library(survival)
+library(riskRegression) # For Fine-Gray model & Score
+library(cmprsk)
+library(rms)            # For RCS analysis
+library(ggplot2)
+library(gridExtra)
+
+# Set global paths
+path_data <- "path/to/total_final.xlsx"
+path_comp <- "path/to/Final_Comparison_Set.xlsx"
+
+# ==============================================================================
+# 1. Data Loading & Preprocessing
+# ==============================================================================
+data <- read_excel(path_data)
+
+# Log-transform and Z-score standardization for CMR variables
+cmr_vars_raw <- c("n_4100_2_0", "n_4101_2_0", "n_4102_2_0", "n_4103_2_0", "n_4104_2_0", 
+                  "n_4105_2_0", "n_4106_2_0", "n_4107_2_0", "n_4108_2_0", "n_4109_2_0", 
+                  "n_4110_2_0", "n_4111_2_0", "n_4112_2_0", "n_4113_2_0", "n_4114_2_0", 
+                  "n_4115_2_0", "n_4116_2_0", "n_4117_2_0", "n_4118_2_0", "n_4119_2_0", 
+                  "n_4120_2_0", "n_4121_2_0", "n_4122_2_0", "n_4123_2_0", "n_4140_2_0", 
+                  "n_4157_2_0", "n_4174_2_0", "n_4181_2_0")
+
+for (var in cmr_vars_raw) {
+  x <- data[[var]]
+  if (all(x > 0, na.rm = TRUE)) x <- log(x)
+  data[[paste0(var, "_z")]] <- as.numeric(scale(x))
+}
+
+# Split into Training (70%) and Validation (30%)
+set.seed(123)
+data$split_group <- ifelse(runif(nrow(data)) < 0.7, "train", "test")
+train_data <- filter(data, split_group == "train")
+test_data  <- filter(data, split_group == "test")
+
+# ==============================================================================
+# 2. Variable Selection (Bootstrap LASSO)
+# ==============================================================================
+run_bootstrap_lasso <- function(data, vars, time_var, event_var, n_boot = 1000) {
+  n <- nrow(data)
+  boot_results <- vector("list", n_boot)
+  
+  for (i in 1:n_boot) {
+    boot_idx <- sample(1:n, n, replace = TRUE)
+    boot_data <- data[boot_idx, ] %>% na.omit()
+    
+    x <- as.matrix(boot_data[, vars])
+    y <- Surv(time = boot_data[[time_var]], event = (boot_data[[event_var]] == 1))
+    
+    cvfit <- cv.glmnet(x, y, family = "cox", nfolds = 10)
+    coef_min <- coef(cvfit, s = "lambda.min")
+    vars_min <- rownames(coef_min)[which(coef_min != 0)]
+    boot_results[[i]] <- vars_min
+  }
+  
+  var_freq <- table(unlist(boot_results)) / n_boot
+  return(names(var_freq[var_freq >= 0.95]))
+}
+
+vars_z <- paste0(cmr_vars_raw, "_z")
+selected_vars <- run_bootstrap_lasso(train_data, vars_z, "followup_time", "status")
+
+# ==============================================================================
+# 3. Main Model: Fine-Gray Competing Risk Analysis
+# ==============================================================================
+# Define final 16 selected CMR variables based on LASSO results
+final_cmr_vars <- c("n_4103_2_0_z", "n_4104_2_0_z", "n_4107_2_0_z", "n_4108_2_0_z",
+                    "n_4109_2_0_z", "n_4111_2_0_z", "n_4113_2_0_z", "n_4116_2_0_z",
+                    "n_4117_2_0_z", "n_4119_2_0_z", "n_4120_2_0_z", "n_4122_2_0_z",
+                    "n_4123_2_0_z", "n_4140_2_0_z", "n_4157_2_0_z", "n_4174_2_0_z")
+
+formula_fg <- as.formula(paste("Hist(followup_time, status) ~ logit_HF_Risk +", 
+                               paste(final_cmr_vars, collapse = " + ")))
+
+# Fit Models (Overall, Male, Female)
+fit_overall <- FGR(formula_fg, data = train_data, cause = 1)
+fit_male    <- FGR(formula_fg, data = subset(train_data, sex == 1), cause = 1)
+fit_female  <- FGR(formula_fg, data = subset(train_data, sex == 0), cause = 1)
+
+# ==============================================================================
+# 4. Restricted Cubic Splines (RCS) for Non-linearity
+# ==============================================================================
+# Setup RMS environment
+dd <- datadist(train_data); options(datadist = "dd")
+
+vars_nonlinear <- c()
+plot_list <- list()
+
+for(var_code in final_cmr_vars) {
+  # Fit Cox model with RCS (knots=3)
+  f <- as.formula(paste0("Surv(followup_time, status==1) ~ logit_HF_Risk + rcs(", var_code, ", 3)"))
+  fit_rcs <- cph(f, data = train_data, x=TRUE, y=TRUE)
+  
+  # Check for non-linearity (ANOVA)
+  an <- anova(fit_rcs)
+  if("Nonlinear" %in% rownames(an) && an["Nonlinear", "P"] < 0.05) {
+    vars_nonlinear <- c(vars_nonlinear, var_code)
+  }
+  
+  # Plotting
+  pred_data <- Predict(fit_rcs, name = var_code, ref.zero = TRUE, fun = exp)
+  p <- ggplot(pred_data) +
+    geom_hline(yintercept = 1, linetype = "dashed") +
+    geom_ribbon(aes_string(x = var_code, ymin = "lower", ymax = "upper"), alpha = 0.2) +
+    geom_line(aes_string(x = var_code, y = "yhat")) +
+    theme_classic() + labs(y = "Hazard Ratio", title = var_code)
+  plot_list[[var_code]] <- p
+}
+
+# Export RCS plots
+tiff("Figure_RCS_Matrix.tiff", width = 18, height = 20, units = "in", res = 300)
+grid.arrange(grobs = plot_list, ncol = 4)
+dev.off()
+
+# ==============================================================================
+# 5. Model Comparison: New Model vs. ARIC vs. PCP
+# ==============================================================================
+df_comp <- read_excel(path_comp)
+
+# Data Cleaning for Comparison
+prepare_comp_data <- function(df) {
+    df$status <- as.numeric(df$status)
+    df$pred_ARIC <- df$ARIC_HF_Score_Pct / 100
+    df$pred_PCP  <- df$PCP_Risk_Percent / 100
+    
+    # Generate predictions from new Fine-Gray models
+    df$pred_new <- NA
+    idx_m <- which(df$sex == 1)
+    idx_f <- which(df$sex == 0)
+    
+    if(length(idx_m) > 0) df$pred_new[idx_m] <- predict(fit_male, newdata = df[idx_m,], times = 3652.5)[,1]
+    if(length(idx_f) > 0) df$pred_new[idx_f] <- predict(fit_female, newdata = df[idx_f,], times = 3652.5)[,1]
+    
+    return(filter(df, !is.na(pred_new) & !is.na(pred_ARIC) & !is.na(pred_PCP)))
+}
+
+df_analysis <- prepare_comp_data(df_comp)
+
+# Calculate C-index and P-values for difference
+score_res <- Score(
+  list("New_Model" = df_analysis$pred_new, "ARIC" = df_analysis$pred_ARIC, "PCP" = df_analysis$pred_PCP),
+  formula = Hist(followup_time, status) ~ 1,
+  data = df_analysis,
+  times = 3652.5,
+  cause = 1,
+  metrics = "auc",
+  conf.int = TRUE
+)
+
+print(score_res$AUC$score)
+print(score_res$AUC$contrasts)
+
+# ==============================================================================
+# 6. Sensitivity Analysis (Optional: Random Forest & Stepwise)
+# ==============================================================================
+library(randomForest)
+rf_model <- randomForest(x = train_data[, final_cmr_vars], 
+                         y = as.factor(train_data$status == 1), 
+                         ntree = 1000)
+print(importance(rf_model))
